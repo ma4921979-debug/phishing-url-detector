@@ -4,7 +4,7 @@ import pandas as pd
 import joblib
 import io
 import os
-import uuid
+import hashlib
 import plotly.express as px
 from datetime import datetime
 from reportlab.lib.pagesizes import letter
@@ -14,15 +14,14 @@ from playwright.sync_api import sync_playwright
 st.set_page_config(page_title="Phishing Detector", layout="wide")
 st.title("🛡️ AI Phishing URL Detector")
 
-ADMIN_PASSWORD = "admin123"
-
-if "session_id" not in st.session_state:
-    st.session_state.session_id = str(uuid.uuid4())
-
-session_id = st.session_state.session_id
+ADMIN_PASSWORD = "admin123"  # غيّرها
 
 model = joblib.load("model.pkl")
 feature_columns = joblib.load("feature_columns.pkl")
+
+
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
 
 
 def create_db():
@@ -30,9 +29,18 @@ def create_db():
     cursor = conn.cursor()
 
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            password TEXT,
+            created_at TEXT
+        )
+    """)
+
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS url_checks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT,
+            username TEXT,
             url TEXT,
             risk_score INTEGER,
             label TEXT,
@@ -44,8 +52,8 @@ def create_db():
     cursor.execute("PRAGMA table_info(url_checks)")
     columns = [col[1] for col in cursor.fetchall()]
 
-    if "session_id" not in columns:
-        cursor.execute("ALTER TABLE url_checks ADD COLUMN session_id TEXT")
+    if "username" not in columns:
+        cursor.execute("ALTER TABLE url_checks ADD COLUMN username TEXT")
 
     conn.commit()
     conn.close()
@@ -54,17 +62,53 @@ def create_db():
 create_db()
 
 
-def save_result(session_id, url, risk_score, label, reasons):
+def register_user(username, password):
+    conn = sqlite3.connect("phishing_history.db")
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("""
+            INSERT INTO users (username, password, created_at)
+            VALUES (?, ?, ?)
+        """, (
+            username,
+            hash_password(password),
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False
+
+
+def login_user(username, password):
+    conn = sqlite3.connect("phishing_history.db")
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT * FROM users
+        WHERE username = ? AND password = ?
+    """, (username, hash_password(password)))
+
+    user = cursor.fetchone()
+    conn.close()
+
+    return user is not None
+
+
+def save_result(username, url, risk_score, label, reasons):
     conn = sqlite3.connect("phishing_history.db")
     cursor = conn.cursor()
 
     checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     cursor.execute("""
-        INSERT INTO url_checks (session_id, url, risk_score, label, reasons, checked_at)
+        INSERT INTO url_checks (username, url, risk_score, label, reasons, checked_at)
         VALUES (?, ?, ?, ?, ?, ?)
     """, (
-        session_id,
+        username,
         url,
         risk_score,
         label,
@@ -77,12 +121,12 @@ def save_result(session_id, url, risk_score, label, reasons):
     return checked_at
 
 
-def load_user_history(session_id):
+def load_user_history(username):
     conn = sqlite3.connect("phishing_history.db")
     df = pd.read_sql_query(
-        "SELECT * FROM url_checks WHERE session_id = ? ORDER BY id DESC",
+        "SELECT * FROM url_checks WHERE username = ? ORDER BY id DESC",
         conn,
-        params=(session_id,)
+        params=(username,)
     )
     conn.close()
     return df
@@ -165,7 +209,8 @@ def explain_url(url):
 
 def capture_screenshot(url):
     os.makedirs("screenshots", exist_ok=True)
-    path = f"screenshots/{session_id}.png"
+    safe_name = st.session_state.username.replace(" ", "_")
+    path = f"screenshots/{safe_name}.png"
 
     try:
         with sync_playwright() as p:
@@ -175,13 +220,12 @@ def capture_screenshot(url):
             page.goto(url, timeout=20000, wait_until="domcontentloaded")
             page.screenshot(path=path, full_page=True)
             browser.close()
-
         return path
     except Exception:
         return None
 
 
-def generate_pdf(url, risk, label, reasons, checked_at, screenshot_path, session_id):
+def generate_pdf(url, risk, label, reasons, checked_at, screenshot_path, username):
     buffer = io.BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=letter)
 
@@ -191,14 +235,13 @@ def generate_pdf(url, risk, label, reasons, checked_at, screenshot_path, session
 
     y -= 40
     pdf.setFont("Helvetica", 12)
+    pdf.drawString(50, y, f"User: {username}")
+    y -= 20
     pdf.drawString(50, y, f"URL: {url}")
-
     y -= 20
     pdf.drawString(50, y, f"Result: {label}")
-
     y -= 20
     pdf.drawString(50, y, f"Risk Score: {risk}%")
-
     y -= 20
     pdf.drawString(50, y, f"Checked At: {checked_at}")
 
@@ -231,7 +274,7 @@ def generate_pdf(url, risk, label, reasons, checked_at, screenshot_path, session
 
     pdf.showPage()
 
-    history_df = load_user_history(session_id)
+    history_df = load_user_history(username)
 
     y = 750
     pdf.setFont("Helvetica-Bold", 16)
@@ -300,21 +343,13 @@ def show_advanced_dashboard(df, title="Dashboard"):
     col4.metric("Average Risk", f"{avg}%")
     col5.metric("Highest Risk", f"{max_risk}%")
 
-    st.divider()
-
     col_a, col_b = st.columns(2)
 
     with col_a:
-        st.subheader("Risk Distribution")
-        fig_pie = px.pie(
-            df,
-            names="label",
-            title="URL Risk Classification"
-        )
+        fig_pie = px.pie(df, names="label", title="URL Risk Classification")
         st.plotly_chart(fig_pie, use_container_width=True)
 
     with col_b:
-        st.subheader("Risk Score by Check")
         fig_bar = px.bar(
             df.sort_values("checked_at"),
             x="checked_at",
@@ -324,7 +359,6 @@ def show_advanced_dashboard(df, title="Dashboard"):
         )
         st.plotly_chart(fig_bar, use_container_width=True)
 
-    st.subheader("Daily Checks")
     daily = df.groupby("date").size().reset_index(name="checks")
     fig_line = px.line(
         daily,
@@ -354,14 +388,62 @@ def show_advanced_dashboard(df, title="Dashboard"):
         )
 
     st.subheader("Full History")
-    columns_to_show = ["id", "url", "risk_score", "label", "reasons", "checked_at"]
-    if "session_id" in df.columns:
-        columns_to_show = ["id", "session_id", "url", "risk_score", "label", "reasons", "checked_at"]
 
-    st.dataframe(
-        df[columns_to_show],
-        use_container_width=True
-    )
+    show_cols = ["id", "username", "url", "risk_score", "label", "reasons", "checked_at"]
+    existing_cols = [col for col in show_cols if col in df.columns]
+
+    st.dataframe(df[existing_cols], use_container_width=True)
+
+
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+if "username" not in st.session_state:
+    st.session_state.username = ""
+
+
+if not st.session_state.logged_in:
+    auth_tab1, auth_tab2 = st.tabs(["Login", "Register"])
+
+    with auth_tab1:
+        st.subheader("Login")
+        login_username = st.text_input("Username", key="login_username")
+        login_password = st.text_input("Password", type="password", key="login_password")
+
+        if st.button("Login"):
+            if login_user(login_username, login_password):
+                st.session_state.logged_in = True
+                st.session_state.username = login_username
+                st.success("Login successful")
+                st.rerun()
+            else:
+                st.error("Invalid username or password")
+
+    with auth_tab2:
+        st.subheader("Register")
+        reg_username = st.text_input("Choose username", key="reg_username")
+        reg_password = st.text_input("Choose password", type="password", key="reg_password")
+
+        if st.button("Create Account"):
+            if reg_username.strip() == "" or reg_password.strip() == "":
+                st.warning("Please fill all fields")
+            else:
+                created = register_user(reg_username, reg_password)
+
+                if created:
+                    st.success("Account created. Please login.")
+                else:
+                    st.error("Username already exists")
+
+    st.stop()
+
+
+st.sidebar.success(f"Logged in as: {st.session_state.username}")
+
+if st.sidebar.button("Logout"):
+    st.session_state.logged_in = False
+    st.session_state.username = ""
+    st.rerun()
 
 
 tab1, tab2, tab3 = st.tabs(["Scanner", "Dashboard", "Admin Panel"])
@@ -387,7 +469,7 @@ with tab1:
                 risk = min(rule_risk, 20)
                 st.success("✅ Low Risk / Safe")
 
-            checked_at = save_result(session_id, url, risk, label, reasons)
+            checked_at = save_result(st.session_state.username, url, risk, label, reasons)
 
             st.metric("Risk Score", f"{risk}%")
 
@@ -403,7 +485,15 @@ with tab1:
             else:
                 st.warning("Screenshot failed or website could not be opened.")
 
-            pdf = generate_pdf(url, risk, label, reasons, checked_at, screenshot_path, session_id)
+            pdf = generate_pdf(
+                url,
+                risk,
+                label,
+                reasons,
+                checked_at,
+                screenshot_path,
+                st.session_state.username
+            )
 
             st.download_button(
                 label="Download PDF Report",
@@ -414,7 +504,7 @@ with tab1:
 
 
 with tab2:
-    user_df = load_user_history(session_id)
+    user_df = load_user_history(st.session_state.username)
     show_advanced_dashboard(user_df, "Your Advanced Dashboard")
 
 
@@ -433,8 +523,9 @@ with tab3:
         if all_df.empty:
             st.info("No data yet.")
         else:
-            users = all_df["session_id"].nunique()
-            st.metric("Unique Users", users)
+            users = all_df["username"].nunique()
+
+            st.metric("Registered Active Users", users)
 
             show_advanced_dashboard(all_df, "Admin Advanced Dashboard")
 
