@@ -14,7 +14,7 @@ from playwright.sync_api import sync_playwright
 st.set_page_config(page_title="Phishing Detector", layout="wide")
 st.title("🛡️ AI Phishing URL Detector")
 
-ADMIN_PASSWORD = "MOHAMMAD20@04"  
+ADMIN_PASSWORD = "admin123"  # غيرها لكلمة سر خاصة فيك
 
 # ---------------- SESSION ----------------
 if "session_id" not in st.session_state:
@@ -263,6 +263,17 @@ def generate_pdf(url, risk, label, reasons, checked_at, screenshot_path, session
     return buffer
 
 
+# ---------------- EXCEL EXPORT ----------------
+def convert_df_to_excel(df):
+    output = io.BytesIO()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="All URL Checks")
+
+    output.seek(0)
+    return output
+
+
 # ---------------- UI ----------------
 tab1, tab2, tab3 = st.tabs(["Scanner", "Dashboard", "Admin Panel"])
 
@@ -379,4 +390,13 @@ with tab3:
             st.dataframe(
                 all_df[["session_id", "url", "risk_score", "label", "reasons", "checked_at"]],
                 use_container_width=True
+            )
+
+            excel_file = convert_df_to_excel(all_df)
+
+            st.download_button(
+                label="📥 Export All Data as Excel",
+                data=excel_file,
+                file_name="all_phishing_checks.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
