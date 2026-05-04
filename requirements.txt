@@ -5,3 +5,4 @@ joblib
 reportlab
 playwright
 openpyxl
+plotly
