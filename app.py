@@ -5,28 +5,26 @@ import joblib
 import io
 import os
 import uuid
+import plotly.express as px
 from datetime import datetime
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from playwright.sync_api import sync_playwright
 
-# ---------------- CONFIG ----------------
 st.set_page_config(page_title="Phishing Detector", layout="wide")
 st.title("🛡️ AI Phishing URL Detector")
 
-ADMIN_PASSWORD = "admin123"  # غيّرها لكلمة سر خاصة فيك
+ADMIN_PASSWORD = "admin123"
 
-# ---------------- SESSION ----------------
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 
 session_id = st.session_state.session_id
 
-# ---------------- LOAD MODEL ----------------
 model = joblib.load("model.pkl")
 feature_columns = joblib.load("feature_columns.pkl")
 
-# ---------------- DATABASE ----------------
+
 def create_db():
     conn = sqlite3.connect("phishing_history.db")
     cursor = conn.cursor()
@@ -100,14 +98,11 @@ def load_all_history():
 def delete_record(record_id):
     conn = sqlite3.connect("phishing_history.db")
     cursor = conn.cursor()
-
     cursor.execute("DELETE FROM url_checks WHERE id = ?", (record_id,))
-
     conn.commit()
     conn.close()
 
 
-# ---------------- FEATURE EXTRACTION ----------------
 def extract_features(url):
     features = {}
     url_lower = url.lower()
@@ -128,7 +123,6 @@ def extract_features(url):
     return pd.DataFrame([features])[feature_columns]
 
 
-# ---------------- EXPLANATION ----------------
 def explain_url(url):
     risk = 0
     reasons = []
@@ -169,7 +163,6 @@ def explain_url(url):
     return risk, reasons
 
 
-# ---------------- SCREENSHOT ----------------
 def capture_screenshot(url):
     os.makedirs("screenshots", exist_ok=True)
     path = f"screenshots/{session_id}.png"
@@ -179,19 +172,15 @@ def capture_screenshot(url):
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(ignore_https_errors=True)
             page = context.new_page()
-
             page.goto(url, timeout=20000, wait_until="domcontentloaded")
             page.screenshot(path=path, full_page=True)
-
             browser.close()
 
         return path
-
     except Exception:
         return None
 
 
-# ---------------- PDF ----------------
 def generate_pdf(url, risk, label, reasons, checked_at, screenshot_path, session_id):
     buffer = io.BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=letter)
@@ -222,7 +211,6 @@ def generate_pdf(url, risk, label, reasons, checked_at, screenshot_path, session
 
     y -= 30
     pdf.drawString(50, y, "Website Screenshot:")
-
     y -= 210
 
     if screenshot_path and os.path.exists(screenshot_path):
@@ -273,7 +261,6 @@ def generate_pdf(url, risk, label, reasons, checked_at, screenshot_path, session
     return buffer
 
 
-# ---------------- EXCEL EXPORT ----------------
 def convert_df_to_excel(df):
     output = io.BytesIO()
 
@@ -284,7 +271,99 @@ def convert_df_to_excel(df):
     return output
 
 
-# ---------------- UI ----------------
+def prepare_dashboard_data(df):
+    df = df.copy()
+    df["checked_at"] = pd.to_datetime(df["checked_at"], errors="coerce")
+    df["date"] = df["checked_at"].dt.date
+    return df
+
+
+def show_advanced_dashboard(df, title="Dashboard"):
+    st.subheader(title)
+
+    if df.empty:
+        st.info("No URL checks yet.")
+        return
+
+    df = prepare_dashboard_data(df)
+
+    total = len(df)
+    phishing = len(df[df["label"] == "High Risk / Phishing"])
+    safe = len(df[df["label"] == "Low Risk / Safe"])
+    avg = round(df["risk_score"].mean(), 2)
+    max_risk = df["risk_score"].max()
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Total Checks", total)
+    col2.metric("High Risk", phishing)
+    col3.metric("Safe URLs", safe)
+    col4.metric("Average Risk", f"{avg}%")
+    col5.metric("Highest Risk", f"{max_risk}%")
+
+    st.divider()
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        st.subheader("Risk Distribution")
+        fig_pie = px.pie(
+            df,
+            names="label",
+            title="URL Risk Classification"
+        )
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    with col_b:
+        st.subheader("Risk Score by Check")
+        fig_bar = px.bar(
+            df.sort_values("checked_at"),
+            x="checked_at",
+            y="risk_score",
+            color="label",
+            title="Risk Score Over Time"
+        )
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+    st.subheader("Daily Checks")
+    daily = df.groupby("date").size().reset_index(name="checks")
+    fig_line = px.line(
+        daily,
+        x="date",
+        y="checks",
+        markers=True,
+        title="Number of URL Checks per Day"
+    )
+    st.plotly_chart(fig_line, use_container_width=True)
+
+    col_c, col_d = st.columns(2)
+
+    with col_c:
+        st.subheader("Top 5 Risky URLs")
+        top_risky = df.sort_values("risk_score", ascending=False).head(5)
+        st.dataframe(
+            top_risky[["url", "risk_score", "label", "checked_at"]],
+            use_container_width=True
+        )
+
+    with col_d:
+        st.subheader("Latest 10 Checks")
+        latest = df.sort_values("checked_at", ascending=False).head(10)
+        st.dataframe(
+            latest[["url", "risk_score", "label", "checked_at"]],
+            use_container_width=True
+        )
+
+    st.subheader("Full History")
+    columns_to_show = ["id", "url", "risk_score", "label", "reasons", "checked_at"]
+    if "session_id" in df.columns:
+        columns_to_show = ["id", "session_id", "url", "risk_score", "label", "reasons", "checked_at"]
+
+    st.dataframe(
+        df[columns_to_show],
+        use_container_width=True
+    )
+
+
 tab1, tab2, tab3 = st.tabs(["Scanner", "Dashboard", "Admin Panel"])
 
 with tab1:
@@ -335,33 +414,8 @@ with tab1:
 
 
 with tab2:
-    st.subheader("Dashboard")
-
-    history_df = load_user_history(session_id)
-
-    if history_df.empty:
-        st.info("No URL checks yet for your session.")
-    else:
-        total = len(history_df)
-        phishing = len(history_df[history_df["label"] == "High Risk / Phishing"])
-        safe = len(history_df[history_df["label"] == "Low Risk / Safe"])
-        avg = round(history_df["risk_score"].mean(), 2)
-
-        col1, col2, col3, col4 = st.columns(4)
-
-        col1.metric("Total Checks", total)
-        col2.metric("High Risk", phishing)
-        col3.metric("Safe URLs", safe)
-        col4.metric("Average Risk", f"{avg}%")
-
-        st.subheader("Risk Distribution")
-        st.bar_chart(history_df["label"].value_counts())
-
-        st.subheader("Your Check History")
-        st.dataframe(
-            history_df[["url", "risk_score", "label", "reasons", "checked_at"]],
-            use_container_width=True
-        )
+    user_df = load_user_history(session_id)
+    show_advanced_dashboard(user_df, "Your Advanced Dashboard")
 
 
 with tab3:
@@ -379,28 +433,10 @@ with tab3:
         if all_df.empty:
             st.info("No data yet.")
         else:
-            total = len(all_df)
-            phishing = len(all_df[all_df["label"] == "High Risk / Phishing"])
-            safe = len(all_df[all_df["label"] == "Low Risk / Safe"])
-            avg = round(all_df["risk_score"].mean(), 2)
             users = all_df["session_id"].nunique()
+            st.metric("Unique Users", users)
 
-            col1, col2, col3, col4, col5 = st.columns(5)
-
-            col1.metric("Total Checks", total)
-            col2.metric("Users", users)
-            col3.metric("High Risk", phishing)
-            col4.metric("Safe URLs", safe)
-            col5.metric("Average Risk", f"{avg}%")
-
-            st.subheader("All Users Risk Distribution")
-            st.bar_chart(all_df["label"].value_counts())
-
-            st.subheader("All Checked URLs")
-            st.dataframe(
-                all_df[["id", "session_id", "url", "risk_score", "label", "reasons", "checked_at"]],
-                use_container_width=True
-            )
+            show_advanced_dashboard(all_df, "Admin Advanced Dashboard")
 
             excel_file = convert_df_to_excel(all_df)
 
