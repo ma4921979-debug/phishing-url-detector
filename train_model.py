@@ -2,33 +2,66 @@ import pandas as pd
 import joblib
 
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, GradientBoostingClassifier
 
 # Load dataset
 df = pd.read_csv("data/dataset.csv")
 
-# Features and target
+# Split features and target
 X = df.drop("Result", axis=1)
 y = df["Result"]
 
-# Split data
+# Train / test split
 X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42
+    X,
+    y,
+    test_size=0.2,
+    random_state=42
 )
 
-# Train model
-model = RandomForestClassifier(n_estimators=100, random_state=42)
-model.fit(X_train, y_train)
+# Models to compare
+models = {
+    "Random Forest": RandomForestClassifier(
+        n_estimators=200,
+        random_state=42
+    ),
+    "Extra Trees": ExtraTreesClassifier(
+        n_estimators=200,
+        random_state=42
+    ),
+    "Gradient Boosting": GradientBoostingClassifier(
+        random_state=42
+    )
+}
 
-# Test model
-y_pred = model.predict(X_test)
-accuracy = accuracy_score(y_test, y_pred)
+best_model = None
+best_name = ""
+best_accuracy = 0
 
-print("Model Accuracy:", accuracy)
+# Train and compare models
+for name, model in models.items():
+    print("=" * 50)
+    print(f"Training: {name}")
 
-# Save model and feature columns
-joblib.dump(model, "model.pkl")
+    model.fit(X_train, y_train)
+    predictions = model.predict(X_test)
+
+    accuracy = accuracy_score(y_test, predictions)
+
+    print(f"Accuracy: {accuracy}")
+    print(classification_report(y_test, predictions))
+
+    if accuracy > best_accuracy:
+        best_accuracy = accuracy
+        best_model = model
+        best_name = name
+
+# Save best model
+joblib.dump(best_model, "model.pkl")
 joblib.dump(list(X.columns), "feature_columns.pkl")
 
-print("Model saved successfully ✅")
+print("=" * 50)
+print("Best Model:", best_name)
+print("Best Accuracy:", best_accuracy)
+print("Best model saved successfully ✅")
