@@ -14,6 +14,8 @@ from playwright.sync_api import sync_playwright
 st.set_page_config(page_title="Phishing Detector", layout="wide")
 st.title("🛡️ AI Phishing URL Detector")
 
+ADMIN_PASSWORD = "MOHAMMAD20@04"  
+
 # ---------------- SESSION ----------------
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
@@ -41,7 +43,6 @@ def create_db():
         )
     """)
 
-    # If old database exists without session_id, add it
     cursor.execute("PRAGMA table_info(url_checks)")
     columns = [col[1] for col in cursor.fetchall()]
 
@@ -75,17 +76,23 @@ def save_result(session_id, url, risk_score, label, reasons):
 
     conn.commit()
     conn.close()
-
     return checked_at
 
 
-def load_history(session_id):
+def load_user_history(session_id):
     conn = sqlite3.connect("phishing_history.db")
     df = pd.read_sql_query(
         "SELECT * FROM url_checks WHERE session_id = ? ORDER BY id DESC",
         conn,
         params=(session_id,)
     )
+    conn.close()
+    return df
+
+
+def load_all_history():
+    conn = sqlite3.connect("phishing_history.db")
+    df = pd.read_sql_query("SELECT * FROM url_checks ORDER BY id DESC", conn)
     conn.close()
     return df
 
@@ -111,7 +118,7 @@ def extract_features(url):
     return pd.DataFrame([features])[feature_columns]
 
 
-# ---------------- EXPLAIN ----------------
+# ---------------- EXPLANATION ----------------
 def explain_url(url):
     risk = 0
     reasons = []
@@ -175,7 +182,7 @@ def capture_screenshot(url):
 
 
 # ---------------- PDF ----------------
-def generate_pdf(url, risk, label, reasons, time_now, screenshot_path, session_id):
+def generate_pdf(url, risk, label, reasons, checked_at, screenshot_path, session_id):
     buffer = io.BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=letter)
 
@@ -194,7 +201,7 @@ def generate_pdf(url, risk, label, reasons, time_now, screenshot_path, session_i
     pdf.drawString(50, y, f"Risk Score: {risk}%")
 
     y -= 20
-    pdf.drawString(50, y, f"Checked At: {time_now}")
+    pdf.drawString(50, y, f"Checked At: {checked_at}")
 
     y -= 30
     pdf.drawString(50, y, "Reasons:")
@@ -226,8 +233,7 @@ def generate_pdf(url, risk, label, reasons, time_now, screenshot_path, session_i
 
     pdf.showPage()
 
-    # Dashboard summary for current user/session only
-    history_df = load_history(session_id)
+    history_df = load_user_history(session_id)
 
     y = 750
     pdf.setFont("Helvetica-Bold", 16)
@@ -258,7 +264,7 @@ def generate_pdf(url, risk, label, reasons, time_now, screenshot_path, session_i
 
 
 # ---------------- UI ----------------
-tab1, tab2 = st.tabs(["Scanner", "Dashboard"])
+tab1, tab2, tab3 = st.tabs(["Scanner", "Dashboard", "Admin Panel"])
 
 with tab1:
     url = st.text_input("Enter URL")
@@ -306,10 +312,11 @@ with tab1:
                 mime="application/pdf"
             )
 
+
 with tab2:
     st.subheader("Dashboard")
 
-    history_df = load_history(session_id)
+    history_df = load_user_history(session_id)
 
     if history_df.empty:
         st.info("No URL checks yet for your session.")
@@ -320,6 +327,7 @@ with tab2:
         avg = round(history_df["risk_score"].mean(), 2)
 
         col1, col2, col3, col4 = st.columns(4)
+
         col1.metric("Total Checks", total)
         col2.metric("High Risk", phishing)
         col3.metric("Safe URLs", safe)
@@ -333,3 +341,42 @@ with tab2:
             history_df[["url", "risk_score", "label", "reasons", "checked_at"]],
             use_container_width=True
         )
+
+
+with tab3:
+    st.subheader("Admin Panel")
+
+    password = st.text_input("Enter Admin Password", type="password")
+
+    if password != ADMIN_PASSWORD:
+        st.warning("Admin access only.")
+    else:
+        st.success("Welcome Admin")
+
+        all_df = load_all_history()
+
+        if all_df.empty:
+            st.info("No data yet.")
+        else:
+            total = len(all_df)
+            phishing = len(all_df[all_df["label"] == "High Risk / Phishing"])
+            safe = len(all_df[all_df["label"] == "Low Risk / Safe"])
+            avg = round(all_df["risk_score"].mean(), 2)
+            users = all_df["session_id"].nunique()
+
+            col1, col2, col3, col4, col5 = st.columns(5)
+
+            col1.metric("Total Checks", total)
+            col2.metric("Users", users)
+            col3.metric("High Risk", phishing)
+            col4.metric("Safe URLs", safe)
+            col5.metric("Average Risk", f"{avg}%")
+
+            st.subheader("All Users Risk Distribution")
+            st.bar_chart(all_df["label"].value_counts())
+
+            st.subheader("All Checked URLs")
+            st.dataframe(
+                all_df[["session_id", "url", "risk_score", "label", "reasons", "checked_at"]],
+                use_container_width=True
+            )
