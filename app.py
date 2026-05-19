@@ -1,6 +1,7 @@
 import streamlit as st
 import sqlite3
 import pandas as pd
+import requests
 import joblib
 import io
 import os
@@ -9,7 +10,7 @@ import mimetypes
 import re
 import math
 import ipaddress
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 import zipfile
 import plotly.express as px
 import numpy as np
@@ -20,6 +21,7 @@ except Exception:
 from datetime import datetime
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
 from playwright.sync_api import sync_playwright
 from company_mode import run_company_mode
 from ai_assistant import render_cyber_ai_assistant
@@ -972,21 +974,65 @@ def analyze_url_logic(url):
 
 
 def capture_screenshot(url):
+    """
+    Returns a screenshot source.
+
+    Priority:
+    1. Local Playwright screenshot when available.
+    2. Cloud-compatible screenshot URL using image.thum.io.
+
+    Streamlit can display both local file paths and remote image URLs using st.image().
+    """
+    normalized_url = normalize_url(url)
+
     os.makedirs("screenshots", exist_ok=True)
     safe_name = st.session_state.username.replace(" ", "_")
     path = f"screenshots/{safe_name}.png"
 
+    # Local desktop / VS Code execution
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            context = browser.new_context(ignore_https_errors=True)
+            context = browser.new_context(ignore_https_errors=True, viewport={"width": 1366, "height": 900})
             page = context.new_page()
-            page.goto(url, timeout=20000, wait_until="domcontentloaded")
-            page.screenshot(path=path, full_page=True)
+            page.goto(normalized_url, timeout=25000, wait_until="domcontentloaded")
+            page.screenshot(path=path, full_page=False)
             browser.close()
-        return path
+
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+
+    except Exception:
+        pass
+
+    # Streamlit Cloud / mobile deployment fallback
+    try:
+        encoded_url = quote(normalized_url, safe="")
+        return f"https://image.thum.io/get/width/1366/crop/900/noanimate/{encoded_url}"
     except Exception:
         return None
+
+
+def _draw_screenshot_on_pdf(pdf, screenshot_source, x, y, width=500, height=200):
+    """
+    Adds either a local screenshot file or a remote screenshot URL to the PDF.
+    """
+    if not screenshot_source:
+        pdf.drawString(x + 10, y + height - 20, "No screenshot available.")
+        return
+
+    try:
+        if str(screenshot_source).startswith("http://") or str(screenshot_source).startswith("https://"):
+            response = requests.get(screenshot_source, timeout=15)
+            response.raise_for_status()
+            image = ImageReader(io.BytesIO(response.content))
+            pdf.drawImage(image, x, y, width=width, height=height, preserveAspectRatio=True, mask="auto")
+        elif os.path.exists(screenshot_source):
+            pdf.drawImage(screenshot_source, x, y, width=width, height=height, preserveAspectRatio=True, mask="auto")
+        else:
+            pdf.drawString(x + 10, y + height - 20, "Screenshot source was not available.")
+    except Exception:
+        pdf.drawString(x + 10, y + height - 20, "Screenshot could not be added to the PDF.")
 
 
 def generate_pdf(url, risk, label, reasons, checked_at, screenshot_path, username):
@@ -1020,21 +1066,14 @@ def generate_pdf(url, risk, label, reasons, checked_at, screenshot_path, usernam
     pdf.drawString(50, y, "Website Screenshot:")
     y -= 210
 
-    if screenshot_path and os.path.exists(screenshot_path):
-        try:
-            pdf.drawImage(
-                screenshot_path,
-                50,
-                y,
-                width=500,
-                height=200,
-                preserveAspectRatio=True,
-                mask="auto"
-            )
-        except Exception:
-            pdf.drawString(60, y + 180, "Screenshot could not be added.")
-    else:
-        pdf.drawString(60, y + 180, "No screenshot available.")
+    _draw_screenshot_on_pdf(
+        pdf,
+        screenshot_path,
+        50,
+        y,
+        width=500,
+        height=200
+    )
 
     pdf.save()
     buffer.seek(0)
@@ -1392,8 +1431,10 @@ with tab1:
 
             if screenshot_path:
                 st.image(screenshot_path, caption="Website Preview", use_container_width=True)
+                if str(screenshot_path).startswith("http"):
+                    st.caption("Screenshot generated using a cloud-compatible preview service.")
             else:
-                st.warning("Screenshot failed or website could not be opened.")
+                st.warning("Screenshot could not be generated for this website.")
 
             pdf = generate_pdf(
                 url,
