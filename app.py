@@ -6,13 +6,23 @@ import io
 import os
 import hashlib
 import mimetypes
+import re
+import math
+import ipaddress
+from urllib.parse import urlparse
+import zipfile
 import plotly.express as px
+import numpy as np
+try:
+    import cv2
+except Exception:
+    cv2 = None
 from datetime import datetime
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from playwright.sync_api import sync_playwright
 from company_mode import run_company_mode
-
+from ai_assistant import render_cyber_ai_assistant
 st.set_page_config(page_title="AI Cybersecurity Platform", layout="wide")
 
 # =========================
@@ -455,44 +465,134 @@ def extract_features(url):
     return pd.DataFrame([features])[feature_columns]
 
 
+def normalize_url(url):
+    url = (url or "").strip()
+    if url and not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url
+
+
+def _safe_parse_url(url):
+    normalized = normalize_url(url)
+    try:
+        parsed = urlparse(normalized)
+        return normalized, parsed
+    except Exception:
+        return normalized, urlparse("")
+
+
+def _looks_like_ip(hostname):
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except Exception:
+        return False
+
+
 def explain_url(url):
+    """
+    Explainable URL risk analysis.
+    Returns: risk_score, reasons, recommendations, positive_signals.
+    """
+    normalized, parsed = _safe_parse_url(url)
+    url_lower = normalized.lower()
+    hostname = (parsed.hostname or "").lower()
+    query = parsed.query or ""
+
     risk = 0
     reasons = []
-    url_lower = url.lower()
+    recommendations = []
+    positive_signals = []
 
-    if url_lower.startswith("http://"):
+    if not hostname:
+        risk += 50
+        reasons.append("URL structure could not be parsed correctly.")
+        recommendations.append("Use a complete URL with a valid domain name.")
+    else:
+        positive_signals.append(f"Domain parsed successfully: {hostname}")
+
+    if parsed.scheme == "http":
         risk += 25
-        reasons.append("Uses HTTP instead of HTTPS")
-
-    if "@" in url:
-        risk += 25
-        reasons.append("Contains @ symbol")
-
-    if "-" in url:
+        reasons.append("Uses HTTP instead of HTTPS, so traffic is not encrypted.")
+        recommendations.append("Avoid entering sensitive data on HTTP pages.")
+    elif parsed.scheme == "https":
+        positive_signals.append("HTTPS is used, which supports encrypted communication.")
+    else:
         risk += 10
-        reasons.append("Contains dash symbol")
+        reasons.append("URL scheme is missing or unusual.")
 
-    if len(url) > 80:
+    if "@" in normalized:
+        risk += 30
+        reasons.append("Contains @ symbol, which can hide the real destination domain.")
+        recommendations.append("Avoid URLs containing @ unless you fully trust the source.")
+    else:
+        positive_signals.append("No @ symbol was found in the URL.")
+
+    if hostname and _looks_like_ip(hostname):
+        risk += 25
+        reasons.append("Uses an IP address instead of a normal domain name.")
+        recommendations.append("Be careful with direct IP links because they are often used to hide identity.")
+    elif hostname:
+        positive_signals.append("The URL uses a domain name instead of a raw IP address.")
+
+    if "-" in hostname:
+        risk += 10
+        reasons.append("Domain contains a dash, which is sometimes used in fake login domains.")
+    else:
+        positive_signals.append("No dash was detected in the domain name.")
+
+    if len(normalized) > 120:
+        risk += 25
+        reasons.append("URL is very long, which may hide redirects or tracking parameters.")
+    elif len(normalized) > 80:
         risk += 15
-        reasons.append("URL is too long")
+        reasons.append("URL is longer than normal and should be reviewed carefully.")
+    else:
+        positive_signals.append("URL length is within a normal range.")
 
-    if url.count(".") > 3:
-        risk += 15
-        reasons.append("Too many subdomains")
+    dot_count = hostname.count(".")
+    if dot_count > 3:
+        risk += 20
+        reasons.append("Domain contains many subdomains, which may be used to imitate trusted websites.")
+    elif hostname:
+        positive_signals.append("Subdomain count looks normal.")
 
-    suspicious_words = ["login", "verify", "account", "bank", "paypal", "update", "secure"]
+    suspicious_words = [
+        "login", "verify", "account", "bank", "paypal", "update", "secure",
+        "wallet", "signin", "password", "confirm", "billing", "support", "free",
+        "gift", "prize", "limited", "unlock", "suspended"
+    ]
+    found_words = sorted({word for word in suspicious_words if word in url_lower})
+    if found_words:
+        risk += min(35, 8 * len(found_words))
+        reasons.append("Suspicious keyword(s) detected: " + ", ".join(found_words))
+        recommendations.append("Verify the link from the official website instead of opening it directly.")
+    else:
+        positive_signals.append("No common phishing keywords were detected.")
 
-    for word in suspicious_words:
-        if word in url_lower:
-            risk += 10
-            reasons.append(f"Suspicious word: {word}")
+    shorteners = ["bit.ly", "tinyurl.com", "t.co", "goo.gl", "is.gd", "ow.ly", "cutt.ly"]
+    if any(shortener in hostname for shortener in shorteners):
+        risk += 25
+        reasons.append("URL uses a shortening service, which can hide the final destination.")
+        recommendations.append("Expand shortened URLs before opening them.")
 
-    risk = min(risk, 100)
+    if query and len(query) > 80:
+        risk += 10
+        reasons.append("URL contains a long query string that may hide tracking or redirect parameters.")
+
+    suspicious_tlds = [".tk", ".ml", ".ga", ".cf", ".gq", ".xyz", ".top"]
+    if any(hostname.endswith(tld) for tld in suspicious_tlds):
+        risk += 10
+        reasons.append("Domain uses a TLD commonly seen in suspicious campaigns.")
 
     if not reasons:
-        reasons.append("No clear suspicious indicators found")
+        reasons.append("No obvious suspicious indicators were detected by rule-based analysis.")
 
-    return risk, reasons
+    if not recommendations:
+        recommendations.append("Still verify the source before entering passwords, payment data, or personal information.")
+
+    risk = max(0, min(risk, 100))
+    return risk, reasons, recommendations, positive_signals
 
 
 def analyze_message(text):
@@ -613,6 +713,108 @@ def analyze_password(password):
     return label, score, reasons, tips
 
 
+
+def _file_entropy(data, max_bytes=200000):
+    sample = data[:max_bytes]
+    if not sample:
+        return 0.0
+    counts = [0] * 256
+    for b in sample:
+        counts[b] += 1
+    entropy = 0.0
+    length = len(sample)
+    for count in counts:
+        if count:
+            p = count / length
+            entropy -= p * math.log2(p)
+    return round(entropy, 2)
+
+
+def _detect_magic_type(file_bytes):
+    signatures = [
+        (b"MZ", "Windows Executable (PE)", "executable"),
+        (b"\x7fELF", "Linux Executable (ELF)", "executable"),
+        (b"\xcf\xfa\xed\xfe", "macOS Mach-O Executable", "executable"),
+        (b"\xfe\xed\xfa\xcf", "macOS Mach-O Executable", "executable"),
+        (b"%PDF", "PDF Document", "document"),
+        (b"PK\x03\x04", "ZIP / Office Open XML Archive", "archive"),
+        (b"\x89PNG\r\n\x1a\n", "PNG Image", "image"),
+        (b"\xff\xd8\xff", "JPEG Image", "image"),
+        (b"GIF87a", "GIF Image", "image"),
+        (b"GIF89a", "GIF Image", "image"),
+        (b"Rar!", "RAR Archive", "archive"),
+        (b"7z\xbc\xaf\x27\x1c", "7-Zip Archive", "archive"),
+    ]
+    for sig, name, category in signatures:
+        if file_bytes.startswith(sig):
+            return name, category
+    return "Unknown / Plain Data", "unknown"
+
+
+def _extension_category(ext):
+    executable = {".exe", ".dll", ".scr", ".com", ".msi", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".jar"}
+    macro_docs = {".docm", ".xlsm", ".pptm"}
+    archives = {".zip", ".rar", ".7z"}
+    documents = {".pdf", ".docx", ".xlsx", ".pptx", ".txt", ".csv"}
+    images = {".png", ".jpg", ".jpeg", ".gif"}
+    if ext in executable:
+        return "executable"
+    if ext in macro_docs:
+        return "macro_document"
+    if ext in archives:
+        return "archive"
+    if ext in documents:
+        return "document"
+    if ext in images:
+        return "image"
+    return "unknown"
+
+
+def _scan_zip_for_macros(file_bytes):
+    indicators = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+            names = z.namelist()
+            lowered = [n.lower() for n in names]
+            if any("vbaproject.bin" in n for n in lowered):
+                indicators.append("Office VBA macro project detected inside the file.")
+            if any(n.endswith(".exe") or n.endswith(".dll") or n.endswith(".js") or n.endswith(".vbs") for n in lowered):
+                indicators.append("Archive contains executable or script files.")
+            if len(names) > 200:
+                indicators.append("Archive contains a large number of files, which should be reviewed carefully.")
+    except Exception:
+        pass
+    return indicators
+
+
+def _scan_text_indicators(file_bytes):
+    indicators = []
+    sample = file_bytes[:250000]
+    try:
+        text_sample = sample.decode("utf-8", errors="ignore").lower()
+    except Exception:
+        text_sample = ""
+
+    patterns = {
+        "powershell": "PowerShell command detected.",
+        "cmd.exe": "Windows command execution reference detected.",
+        "wscript": "Windows script host reference detected.",
+        "createobject": "Script object creation pattern detected.",
+        "eval(": "JavaScript eval() pattern detected.",
+        "base64": "Base64-related keyword detected.",
+        "http://": "External HTTP link detected inside file content.",
+        "https://": "External HTTPS link detected inside file content.",
+        "document.write": "JavaScript document.write pattern detected.",
+        "shell.application": "Shell execution object reference detected.",
+    }
+
+    for pattern, message in patterns.items():
+        if pattern in text_sample:
+            indicators.append(message)
+
+    return list(dict.fromkeys(indicators))
+
+
 def analyze_file(uploaded_file):
     risk = 0
     reasons = []
@@ -623,49 +825,150 @@ def analyze_file(uploaded_file):
     file_extension = os.path.splitext(file_name)[1].lower()
     mime_type, _ = mimetypes.guess_type(file_name)
 
-    dangerous_extensions = [
-        ".exe", ".bat", ".cmd", ".scr", ".js", ".vbs",
-        ".ps1", ".jar", ".msi", ".dll", ".com"
-    ]
-
-    suspicious_extensions = [
-        ".zip", ".rar", ".7z", ".docm", ".xlsm", ".pptm"
-    ]
-
-    if file_extension in dangerous_extensions:
-        risk += 60
-        reasons.append(f"Dangerous file extension: {file_extension}")
-        tips.append("Do NOT open executable files from unknown sources.")
-
-    elif file_extension in suspicious_extensions:
-        risk += 35
-        reasons.append(f"Suspicious file extension: {file_extension}")
-        tips.append("Scan compressed or macro-enabled files before opening.")
-
-    else:
-        reasons.append("File extension looks normal.")
-
-    if file_size > 10 * 1024 * 1024:
-        risk += 15
-        reasons.append("Large file size detected.")
-        tips.append("Large files should be verified carefully.")
-
     file_bytes = uploaded_file.getvalue()
     file_hash = hashlib.sha256(file_bytes).hexdigest()
+    magic_type, magic_category = _detect_magic_type(file_bytes)
+    extension_category = _extension_category(file_extension)
+    entropy = _file_entropy(file_bytes)
 
-    risk = min(risk, 100)
+    reasons.append(f"Detected file signature: {magic_type}")
+    reasons.append("SHA-256 hash calculated for integrity tracking.")
 
-    if risk >= 60:
+    if file_size == 0:
+        risk += 20
+        reasons.append("File is empty, which is unusual and should be verified.")
+
+    if file_size > 10 * 1024 * 1024:
+        risk += 10
+        reasons.append("Large file size detected.")
+        tips.append("Verify large files carefully before opening them.")
+
+    if extension_category == "executable":
+        risk += 55
+        reasons.append(f"Executable/script extension detected: {file_extension}")
+        tips.append("Do not run executable or script files unless they come from a trusted source.")
+    elif extension_category == "macro_document":
+        risk += 40
+        reasons.append(f"Macro-enabled Office extension detected: {file_extension}")
+        tips.append("Disable macros unless the document source is fully trusted.")
+    elif extension_category == "archive":
+        risk += 20
+        reasons.append(f"Archive extension detected: {file_extension}")
+        tips.append("Extract archives only in a safe environment and scan their contents.")
+    elif extension_category in {"document", "image"}:
+        reasons.append("File extension category is commonly used for normal documents/images.")
+    else:
+        risk += 10
+        reasons.append("Unknown or uncommon file extension detected.")
+        tips.append("Unknown file types should be verified before opening.")
+
+    if magic_category == "executable":
+        risk += 70
+        reasons.append("Executable binary signature detected from file content, not only from the file name.")
+        tips.append("Treat this file as high risk unless it is expected and trusted.")
+
+    if magic_category == "archive":
+        zip_indicators = _scan_zip_for_macros(file_bytes)
+        for indicator in zip_indicators:
+            risk += 25
+            reasons.append(indicator)
+            tips.append("Review archive contents and scan them before opening.")
+
+    if magic_category == "executable" and extension_category != "executable":
+        risk += 35
+        reasons.append("File content looks executable but the extension does not match. This may indicate disguised malware.")
+        tips.append("Do not open files whose content type does not match their extension.")
+
+    if extension_category == "executable" and magic_category not in {"executable", "archive", "unknown"}:
+        risk += 25
+        reasons.append("Executable extension does not match the detected file signature.")
+
+    content_indicators = _scan_text_indicators(file_bytes)
+    for indicator in content_indicators:
+        risk += 10
+        reasons.append(indicator)
+
+    if entropy >= 7.5 and file_size > 1024:
+        risk += 15
+        reasons.append(f"High entropy detected ({entropy}), which may indicate packing/encryption.")
+        tips.append("Packed or encrypted files should be scanned with an antivirus engine.")
+    else:
+        reasons.append(f"Entropy level: {entropy}")
+
+    risk = max(0, min(risk, 100))
+
+    if risk >= 70:
         label = "High Risk File"
-    elif risk >= 30:
+    elif risk >= 35:
         label = "Medium Risk File"
     else:
         label = "Low Risk File"
 
     if not tips:
-        tips.append("File seems safe, but always verify the source before opening.")
+        tips.append("No strong local risk indicators were found, but this is not a full antivirus scan.")
 
-    return label, risk, reasons, tips, file_hash, mime_type
+    tips.append("For final malware confirmation, scan the SHA-256 hash or file with a trusted antivirus or VirusTotal-like service.")
+
+    return label, risk, reasons, tips, file_hash, mime_type or "Unknown"
+
+
+
+def decode_qr_image(uploaded_file):
+    if cv2 is None:
+        return None, "OpenCV is not installed. Run: python -m pip install opencv-python pillow"
+
+    try:
+        file_bytes = uploaded_file.getvalue()
+        np_arr = np.frombuffer(file_bytes, np.uint8)
+        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+        if image is None:
+            return None, "Could not read the uploaded image."
+
+        detector = cv2.QRCodeDetector()
+        data, bbox, _ = detector.detectAndDecode(image)
+
+        if data:
+            return data.strip(), None
+
+        return None, "No QR code was detected in this image."
+
+    except Exception as e:
+        return None, str(e)
+
+
+
+def analyze_url_logic(url):
+    features = extract_features(url)
+    prediction = model.predict(features)[0]
+    rule_risk, reasons, recommendations, positive_signals = explain_url(url)
+
+    model_reason = "Machine learning model classified the URL as phishing." if prediction == -1 else "Machine learning model classified the URL as legitimate."
+
+    if prediction == -1:
+        final_risk = max(rule_risk, 70)
+    else:
+        final_risk = rule_risk
+
+    final_risk = max(0, min(final_risk, 100))
+
+    if final_risk >= 70:
+        label = "High Risk / Phishing"
+    elif final_risk >= 35:
+        label = "Medium Risk / Suspicious"
+    else:
+        label = "Low Risk / Safe"
+
+    reasons = [model_reason] + reasons
+
+    if label == "Low Risk / Safe":
+        recommendations.insert(0, "No major URL indicators were found, but continue to verify the sender/source before sharing sensitive data.")
+    elif label == "Medium Risk / Suspicious":
+        recommendations.insert(0, "Do not enter credentials until the domain is manually verified.")
+    else:
+        recommendations.insert(0, "Do not open this link or enter sensitive information unless verified through an official source.")
+
+    return label, final_risk, reasons, recommendations, positive_signals
 
 
 def capture_screenshot(url):
@@ -960,7 +1263,7 @@ if not st.session_state.logged_in:
 # SIDEBAR
 # =========================
 st.sidebar.success(f"Logged in as: {st.session_state.username}")
-
+render_cyber_ai_assistant()
 if st.sidebar.button("Logout"):
     st.session_state.logged_in = False
     st.session_state.username = ""
@@ -1040,12 +1343,13 @@ if st.session_state.mode == "company":
 # =========================
 # USER MODE — LEVEL 1
 # =========================
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "URL Scanner",
     "Dashboard",
     "Email Analyzer",
     "Password Analyzer",
-    "File Checker"
+    "File Checker",
+    "QR Scanner"
 ])
 
 
@@ -1058,27 +1362,30 @@ with tab1:
         if url.strip() == "":
             st.warning("Enter URL")
         else:
-            features = extract_features(url)
-            prediction = model.predict(features)[0]
+            label, risk, reasons, recommendations, positive_signals = analyze_url_logic(url)
 
-            rule_risk, reasons = explain_url(url)
-
-            if prediction == -1:
-                label = "High Risk / Phishing"
-                risk = max(rule_risk, 70)
-                st.error("⚠️ High Risk / Phishing")
+            if risk >= 70:
+                st.error(f"⚠️ {label}")
+            elif risk >= 35:
+                st.warning(f"⚠️ {label}")
             else:
-                label = "Low Risk / Safe"
-                risk = min(rule_risk, 20)
-                st.success("✅ Low Risk / Safe")
+                st.success(f"✅ {label}")
 
-            checked_at = save_result(st.session_state.username, url, risk, label, reasons)
+            checked_at = save_result(st.session_state.username, normalize_url(url), risk, label, reasons + recommendations)
 
             st.metric("Risk Score", f"{risk}%")
 
-            st.subheader("Analysis Reasons")
+            st.subheader("Why this result?")
             for reason in reasons:
                 st.write("- " + reason)
+
+            st.subheader("Positive Signals")
+            for signal in positive_signals:
+                st.write("- " + signal)
+
+            st.subheader("Recommendations")
+            for rec in recommendations:
+                st.write("- " + rec)
 
             st.subheader("Website Screenshot")
             screenshot_path = capture_screenshot(url)
@@ -1092,7 +1399,7 @@ with tab1:
                 url,
                 risk,
                 label,
-                reasons,
+                reasons + recommendations,
                 checked_at,
                 screenshot_path,
                 st.session_state.username
@@ -1195,6 +1502,7 @@ with tab4:
 
 with tab5:
     st.subheader("📁 File Risk Checker")
+    st.info("This checker performs local static analysis using file signature, MIME guess, hash, size, entropy, extension mismatch, archive/macro indicators, and suspicious content patterns. It is not a full antivirus replacement.")
 
     uploaded_file = st.file_uploader("Upload a file to analyze:")
 
@@ -1217,7 +1525,7 @@ with tab5:
             st.write(f"MIME Type: {mime_type}")
             st.write(f"SHA-256 Hash: {file_hash}")
 
-            st.subheader("Analysis Reasons")
+            st.subheader("Why this result?")
             for reason in reasons:
                 st.write("- " + reason)
 
@@ -1235,3 +1543,101 @@ with tab5:
                 label,
                 reasons + tips
             )
+
+
+with tab6:
+    st.subheader("QR Code Scanner")
+
+    st.write("Scan QR codes by uploading an image or using your camera.")
+
+    scan_method = st.radio(
+        "Choose scan method:",
+        ["Upload QR Image", "Use Camera"],
+        horizontal=True
+    )
+
+    qr_source = None
+
+    if scan_method == "Upload QR Image":
+        qr_source = st.file_uploader(
+            "Upload QR Code Image",
+            type=["png", "jpg", "jpeg"],
+            key="qr_uploader"
+        )
+
+        if qr_source is not None:
+            st.image(qr_source, caption="Uploaded QR Code", use_container_width=True)
+
+    else:
+        st.info("Open this project from your phone or laptop and allow camera permission.")
+        qr_source = st.camera_input("Take a QR Code Photo", key="qr_camera")
+
+        if qr_source is not None:
+            st.image(qr_source, caption="Captured QR Code", use_container_width=True)
+
+    if qr_source is not None:
+        decoded_text, error = decode_qr_image(qr_source)
+
+        if error:
+            st.error(error)
+        elif not decoded_text:
+            st.warning("No readable QR code was detected. Try a clearer image or move the camera closer.")
+        else:
+            st.success("QR Code decoded successfully.")
+            st.write("Decoded Content:")
+            st.code(decoded_text)
+
+            if decoded_text.startswith("http://") or decoded_text.startswith("https://"):
+                label, risk, reasons, recommendations, positive_signals = analyze_url_logic(decoded_text)
+
+                if risk >= 70:
+                    st.error(label)
+                elif risk >= 35:
+                    st.warning(label)
+                else:
+                    st.success(label)
+
+                st.metric("QR URL Risk Score", f"{risk}%")
+
+                st.subheader("Why this result?")
+                for reason in reasons:
+                    st.write("- " + reason)
+
+                st.subheader("Positive Signals")
+                for signal in positive_signals:
+                    st.write("- " + signal)
+
+                st.subheader("Recommendations")
+                for rec in recommendations:
+                    st.write("- " + rec)
+
+                checked_at = save_result(
+                    st.session_state.username,
+                    normalize_url(decoded_text),
+                    risk,
+                    label,
+                    reasons + recommendations
+                )
+
+                st.session_state.last_url_scan = {
+                    "source": "QR Scanner",
+                    "url": decoded_text,
+                    "risk_score": risk,
+                    "label": label,
+                    "reasons": reasons,
+                    "checked_at": checked_at
+                }
+
+                st.info("The QR link was saved in your URL history and dashboard.")
+            else:
+                st.warning("The QR code does not contain a URL. It contains text only.")
+
+                save_tool_activity(
+                    st.session_state.username,
+                    "QR Scanner",
+                    decoded_text[:120],
+                    0,
+                    "Text QR",
+                    ["QR code contains text, not a URL."]
+                )
+
